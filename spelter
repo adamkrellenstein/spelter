@@ -1,0 +1,275 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+from __future__ import print_function, division
+
+import sys
+import types 
+import struct
+import argparse
+import Crypto.Random
+import Crypto.Util.RFC1751
+import scrypt
+import hashlib
+import json
+import binascii
+import errno
+import futures
+import ecdsa
+import pybitcointools
+
+
+# User‐configurable values
+# UNIT = 100000000 / 1000   # mBTC
+# UNIT_NAME = 'mBTC'
+UNIT = 100000000 / 1        # BTC
+UNIT_NAME = 'BTC'
+DEFAULT_COMPRESSED = True
+
+DUST_SIZE = 60000
+
+# Base58, etc.
+__b58chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+LITTLEENDIAN  = '<'
+BIGENDIAN     = '>'
+VERSION_ADDRESS = 0
+VERSION_PUBLIC_KEY = 5
+VERSION_PRIVATE_KEY = 128
+
+# secp256k1, <http://www.oid-info.com/get/1.3.132.0.10>
+_p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2FL
+_r = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141L
+_b = 0x0000000000000000000000000000000000000000000000000000000000000007L
+_a = 0x0000000000000000000000000000000000000000000000000000000000000000L
+_Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798L
+_Gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8L
+curve_secp256k1 = ecdsa.ellipticcurve.CurveFp( _p, _a, _b )
+generator_secp256k1 = ecdsa.ellipticcurve.Point(curve_secp256k1, _Gx, _Gy, _r)
+oid_secp256k1 = (1,3,132,0,10)
+SECP256k1 = ecdsa.curves.Curve('SECP256k1', curve_secp256k1,
+                               generator_secp256k1, oid_secp256k1) 
+
+
+dhash = lambda x: hashlib.sha256(hashlib.sha256(x).digest()).digest()
+json_print = lambda x: print(json.dumps(x, sort_keys=True, indent=4))
+
+
+# Convert hexadecimal to binary. Endianness is switched iff endIn != endOut.
+def hex_to_binary(h, endIn=LITTLEENDIAN, endOut=LITTLEENDIAN):
+   bout = h[:]  # Copies data, no references.
+   if not endIn==endOut:
+      bout = hex_switchEndian(bout)
+   return bout.decode('hex_codec')
+
+def hash160 (public_key):
+    md = hashlib.new('ripemd160')
+    md.update(hashlib.sha256(public_key).digest())
+    return md.digest()
+
+
+def base58_check_encode(s, version):
+    # Calculate checksum.
+    vs = chr(version) + s
+    check = dhash(vs)[:4]
+    foo = vs + check
+
+    # Pad.
+    pad = 0
+    for c in foo:
+        if c == chr(0): pad += 1
+        else: break
+
+    # Base58 encode.
+    n = int('0x' + foo.encode('hex'), 16)
+    l = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        l.insert(0, (__b58chars[r]))
+    res = ''.join(l)
+
+    return __b58chars[0] * pad + res
+
+def base58_check_decode(s, version):
+    # Pad.
+    pad = 0
+    for c in s:
+        if c == __b58chars[0]: pad += 1
+        else: break
+    
+    # Base58 decode.
+    n = 0
+    for ch in s:
+        n *= 58
+        digit = __b58chars.index(ch)
+        n += digit
+    h = '%x' % n
+    if len(h) % 2:
+        h = '0' + h
+    res = h.decode('hex')
+
+    # Get data.
+    k = chr(version) * pad + res
+    v0, data, check0 = k[0], k[1:-4], k[-4:]
+
+    # Verify checksum.
+    check1 = dhash(v0 + data)[:4]
+    if check0 != check1:
+        print('Error: ‘%s’ is corrupted.' % s, file=sys.stderr)
+        sys.exit(errno.EINVAL)
+
+    return data
+
+
+def sign_tx(unsigned_tx, wallet):
+    private_key_hex = binascii.hexlify(base58_check_decode(wallet.private_key_wif, VERSION_PRIVATE_KEY))
+    tx = unsigned_tx
+    i = 0
+    while True:
+        try:
+            tx = pybitcointools.sign(tx, i, private_key_hex)
+        except IndexError:
+            break
+        i += 1
+
+    return tx
+
+def broadcast_tx(signed_tx):
+    return pybitcointools.pushtx(signed_tx)
+
+class Wallet:
+    def __init__ (self, generate=False):
+        self.compressed = DEFAULT_COMPRESSED
+
+        # Generate new wallet (i.e. seed) on null input.
+        if generate:
+            self.seed = Crypto.Random.get_random_bytes(int(128/8))
+        else:
+            unknown_input = raw_input('Enter a seed (RFC 1751) or private key '
+                                      '(Wallet Import Format): ')
+            if not unknown_input: sys.exit(errno.EINVAL)
+
+            # If the input does not contain any spaces, it’s a private key.
+            if ' ' not in unknown_input:
+                private_key_wif = unknown_input
+                self.private_key = base58_check_decode(private_key_wif,
+                                                       VERSION_ADDRESS)
+                if len(self.private_key) == 32:
+                    self.compressed = False
+                elif len(self.private_key) == 33:
+                    self.private_key = self.private_key[0:32]
+                else:
+                    print('Error: Invalid private key (wrong length).',
+                          file=sys.stderr)
+                    sys.exit(errno.EINVAL)
+                self.seed = None
+            # If the input does contain at least one space, it’s an RFC 1751 seed.
+            else:
+                self.seed = Crypto.Util.RFC1751.english_to_key(unknown_input)
+                if (not unknown_input.upper() == Crypto.Util.RFC1751.key_to_english(self.seed) or
+                    not len(self.seed) * 8 == 128): # HACK
+                    print('Error: Invalid RFC 1751 seed (wrong length). '
+                            'RFC 1751 seeds must be twelve words long.',
+                          file=sys.stderr)
+                    sys.exit(errno.EINVAL)
+
+        if self.seed:
+            self.private_key = scrypt.hash(self.seed, salt='', buflen=32)
+            self.seed_rfc1751 = Crypto.Util.RFC1751.key_to_english(self.seed)
+        else:
+            self.seed_rfc1751 = None
+
+        # Get private key in Wallet Import Format from the raw private key.
+        if self.compressed:
+            self.private_key_wif = base58_check_encode(self.private_key+chr(1),
+                                                       VERSION_PRIVATE_KEY)
+        else:
+            self.private_key_wif = base58_check_encode(self.private_key,
+                                                       VERSION_PRIVATE_KEY)
+
+        # Initialise ECDSA key object.
+        private_key_int = int('0x' + self.private_key.encode('hex'), 16)
+        self.pko = ecdsa.SigningKey.from_secret_exponent(private_key_int,
+                                                         curve = SECP256k1)
+
+        # Get public key from private key.
+        # <https://bitcointalk.org/index.php?topic=84238.0>
+        public_key_uncompressed = self.pko.get_verifying_key().to_string()
+
+        # Compress public key?
+        if self.compressed:
+            public_key_uncompressed_hex = binascii.hexlify(public_key_uncompressed)
+            x_hex = public_key_uncompressed_hex[:64]
+            y_hex = public_key_uncompressed_hex[64:]
+            if y_hex[-1] in '02468ace': # Is last digit of y‐cöordinate even?
+                public_key_compressed_hex = '02' + x_hex
+            else:
+                public_key_compressed_hex = '03' + x_hex
+            self.public_key = hex_to_binary(public_key_compressed_hex)
+            self.public_key_hex = public_key_compressed_hex
+        else:
+            self.public_key = '\x04' + public_key_uncompressed
+            self.public_key_hex = public_key_uncompressed_hex
+
+        # Get address from public key.
+        address_hash160 = hash160(self.public_key)
+        self.address = base58_check_encode(address_hash160, VERSION_ADDRESS)
+
+    # Print out wallet.
+    def print (self):
+        wallet_printable = {
+                    'seed_rfc1751': self.seed_rfc1751,
+                    'public_key_hex': self.public_key_hex,
+                    'private_key_wif': self.private_key_wif,
+                    'address': self.address
+                 }
+        print('\nWallet:')
+        json_print(wallet_printable)
+
+
+if __name__ == '__main__':
+
+    # Parse command‐line arguments.
+    parser = argparse.ArgumentParser(prog='cuprum', description='')
+    parser.add_argument('--version', action='store_true', 
+                        help='print version information')
+    subparsers = parser.add_subparsers(dest='action', 
+                                       help='the action to be taken')
+
+    parser_generate = subparsers.add_parser('generate', help='generate and print a new wallet')
+    parser_wallet = subparsers.add_parser('wallet', help='print an old wallet')
+    parser_sign_tx = subparsers.add_parser('sign_tx', help='sign an unsigned transaction')
+    parser_sign_tx.add_argument('unsigned_tx', type=str, help='hex serialisation of unsigned transaction')
+    parser_broadcast_tx = subparsers.add_parser('broadcast_tx', help='broadcast a signed transaction')
+    parser_broadcast_tx.add_argument('signed_tx', type=str, help='hex serialisation of signed transaction')
+
+    args = parser.parse_args()
+
+
+    # Do something.
+    if args.version:
+        print('This is Version 1 of cuprum.')
+
+    elif args.action == 'generate':
+        wallet = Wallet(generate=True)
+        wallet.print()
+
+    elif args.action == 'wallet':
+        wallet = Wallet()
+        wallet.print()
+
+    elif args.action == 'sign_tx':
+        wallet = Wallet()
+        print(sign_tx(args.unsigned_tx, wallet))
+
+    elif args.action == 'broadcast_tx':
+        print(broadcast_tx(args.signed_tx))
+
+    elif args.action == 'help':
+        parser.print_help()
+        sys.exit(errno.EINVAL)
+
+    else:
+        parser.print_help()
+        sys.exit(errno.EINVAL)
+
+
+# vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
