@@ -3,8 +3,6 @@
 from __future__ import print_function, division
 
 import sys
-import types 
-import struct
 import argparse
 import Crypto.Random
 import Crypto.Util.RFC1751
@@ -13,8 +11,6 @@ import hashlib
 import json
 import binascii
 import errno
-import futures
-import ecdsa
 import pybitcointools
 
 
@@ -29,42 +25,21 @@ DUST_SIZE = 60000
 
 # Base58, etc.
 __b58chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-LITTLEENDIAN  = '<'
-BIGENDIAN     = '>'
 VERSION_ADDRESS = 0
 VERSION_PUBLIC_KEY = 5
 VERSION_PRIVATE_KEY = 128
 
-# secp256k1, <http://www.oid-info.com/get/1.3.132.0.10>
-_p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2FL
-_r = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141L
-_b = 0x0000000000000000000000000000000000000000000000000000000000000007L
-_a = 0x0000000000000000000000000000000000000000000000000000000000000000L
-_Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798L
-_Gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8L
-curve_secp256k1 = ecdsa.ellipticcurve.CurveFp( _p, _a, _b )
-generator_secp256k1 = ecdsa.ellipticcurve.Point(curve_secp256k1, _Gx, _Gy, _r)
-oid_secp256k1 = (1,3,132,0,10)
-SECP256k1 = ecdsa.curves.Curve('SECP256k1', curve_secp256k1,
-                               generator_secp256k1, oid_secp256k1) 
-
-
 dhash = lambda x: hashlib.sha256(hashlib.sha256(x).digest()).digest()
-json_print = lambda x: print(json.dumps(x, sort_keys=True, indent=4))
 
 
 # Convert hexadecimal to binary. Endianness is switched iff endIn != endOut.
+LITTLEENDIAN  = '<'
+BIGENDIAN     = '>'
 def hex_to_binary(h, endIn=LITTLEENDIAN, endOut=LITTLEENDIAN):
    bout = h[:]  # Copies data, no references.
    if not endIn==endOut:
       bout = hex_switchEndian(bout)
    return bout.decode('hex_codec')
-
-def hash160 (public_key):
-    md = hashlib.new('ripemd160')
-    md.update(hashlib.sha256(public_key).digest())
-    return md.digest()
-
 
 def base58_check_encode(s, version):
     # Calculate checksum.
@@ -119,22 +94,6 @@ def base58_check_decode(s, version):
     return data
 
 
-def sign_tx(unsigned_tx, wallet):
-    private_key_hex = binascii.hexlify(base58_check_decode(wallet.private_key_wif, VERSION_PRIVATE_KEY))
-    tx = unsigned_tx
-    i = 0
-    while True:
-        try:
-            tx = pybitcointools.sign(tx, i, private_key_hex)
-        except IndexError:
-            break
-        i += 1
-
-    return tx
-
-def broadcast_tx(signed_tx):
-    return pybitcointools.pushtx(signed_tx)
-
 class Wallet:
     def __init__ (self, generate=False):
         self.compressed = DEFAULT_COMPRESSED
@@ -184,19 +143,13 @@ class Wallet:
         else:
             self.private_key_wif = base58_check_encode(self.private_key,
                                                        VERSION_PRIVATE_KEY)
+        self.private_key_hex = binascii.hexlify(self.private_key)
 
-        # Initialise ECDSA key object.
-        private_key_int = int('0x' + self.private_key.encode('hex'), 16)
-        self.pko = ecdsa.SigningKey.from_secret_exponent(private_key_int,
-                                                         curve = SECP256k1)
-
-        # Get public key from private key.
-        # <https://bitcointalk.org/index.php?topic=84238.0>
-        public_key_uncompressed = self.pko.get_verifying_key().to_string()
-
-        # Compress public key?
+        # Get public key.
+        public_key_uncompressed_hex = pybitcointools.privtopub(self.private_key_hex)
+        public_key_uncompressed = binascii.unhexlify(public_key_uncompressed_hex)
         if self.compressed:
-            public_key_uncompressed_hex = binascii.hexlify(public_key_uncompressed)
+            public_key_uncompressed_hex = public_key_uncompressed_hex[2:]   # Strip initial '\x04'.
             x_hex = public_key_uncompressed_hex[:64]
             y_hex = public_key_uncompressed_hex[64:]
             if y_hex[-1] in '02468ace': # Is last digit of y‐cöordinate even?
@@ -206,38 +159,59 @@ class Wallet:
             self.public_key = hex_to_binary(public_key_compressed_hex)
             self.public_key_hex = public_key_compressed_hex
         else:
-            self.public_key = '\x04' + public_key_uncompressed
+            self.public_key = public_key_uncompressed
             self.public_key_hex = public_key_uncompressed_hex
 
         # Get address from public key.
-        address_hash160 = hash160(self.public_key)
-        self.address = base58_check_encode(address_hash160, VERSION_ADDRESS)
+        self.address = pybitcointools.pubtoaddr(self.public_key_hex)
 
-    # Print out wallet.
+        self.wallet_dict = {
+                            'seed_rfc1751': self.seed_rfc1751,
+                            'public_key_hex': self.public_key_hex,
+                            'private_key_wif': self.private_key_wif,
+                            'address': self.address
+                           }
+        self.wallet_json = json.dumps(self.wallet_dict, sort_keys=True, indent=4)
+
     def print (self):
-        wallet_printable = {
-                    'seed_rfc1751': self.seed_rfc1751,
-                    'public_key_hex': self.public_key_hex,
-                    'private_key_wif': self.private_key_wif,
-                    'address': self.address
-                 }
-        print('\nWallet:')
-        json_print(wallet_printable)
+        print(self.wallet_json)
+
+    # Save wallet.
+    def save (self):
+        filename = self.address + '.spelter.json'
+        with open(filename, 'w') as outfile:
+            outfile.write(self.wallet_json + '\n')
+        print('Wallet saved to:', filename, file=sys.stderr)
+
+
+def sign_tx(unsigned_tx, wallet):
+    private_key_hex = binascii.hexlify(base58_check_decode(wallet.private_key_wif, VERSION_PRIVATE_KEY))
+    tx = unsigned_tx
+    for i in range(len(pybitcointools.deserialize(tx)['ins'])):
+        tx = pybitcointools.sign(tx, i, private_key_hex)
+    signed_tx = tx
+    return signed_tx
+
+def broadcast_tx(signed_tx):
+    return pybitcointools.pushtx(signed_tx)
 
 
 if __name__ == '__main__':
 
     # Parse command‐line arguments.
-    parser = argparse.ArgumentParser(prog='cuprum', description='')
+    parser = argparse.ArgumentParser(prog='spelter', description='')
     parser.add_argument('--version', action='store_true', 
                         help='print version information')
     subparsers = parser.add_subparsers(dest='action', 
                                        help='the action to be taken')
 
     parser_generate = subparsers.add_parser('generate', help='generate and print a new wallet')
+
     parser_wallet = subparsers.add_parser('wallet', help='print an old wallet')
+
     parser_sign_tx = subparsers.add_parser('sign_tx', help='sign an unsigned transaction')
     parser_sign_tx.add_argument('unsigned_tx', type=str, help='hex serialisation of unsigned transaction')
+
     parser_broadcast_tx = subparsers.add_parser('broadcast_tx', help='broadcast a signed transaction')
     parser_broadcast_tx.add_argument('signed_tx', type=str, help='hex serialisation of signed transaction')
 
@@ -246,11 +220,12 @@ if __name__ == '__main__':
 
     # Do something.
     if args.version:
-        print('This is Version 1 of cuprum.')
+        print('This is Version 1 of spelter.')
 
     elif args.action == 'generate':
         wallet = Wallet(generate=True)
         wallet.print()
+        wallet.save()
 
     elif args.action == 'wallet':
         wallet = Wallet()
@@ -258,7 +233,12 @@ if __name__ == '__main__':
 
     elif args.action == 'sign_tx':
         wallet = Wallet()
-        print(sign_tx(args.unsigned_tx, wallet))
+        signed_tx = sign_tx(args.unsigned_tx, wallet)
+        print('Signed transaction:', signed_tx)
+        print('Signed transaction saved to: ./signed.hex')
+	with open('signed.hex', 'w') as f:
+	    f.write(signed_tx)
+	    f.write('\n')
 
     elif args.action == 'broadcast_tx':
         print(broadcast_tx(args.signed_tx))
