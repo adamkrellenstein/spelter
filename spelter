@@ -1,5 +1,7 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
+"""a simple wallet interface to pybitcointools"""
+
 from __future__ import print_function, division
 
 import sys
@@ -24,7 +26,7 @@ DEFAULT_COMPRESSED = True
 DUST_SIZE = 60000
 
 # Base58, etc.
-__b58chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+b58chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 VERSION_ADDRESS = 0
 VERSION_PUBLIC_KEY = 5
 VERSION_PRIVATE_KEY = 128
@@ -33,48 +35,52 @@ dhash = lambda x: hashlib.sha256(hashlib.sha256(x).digest()).digest()
 
 
 # Convert hexadecimal to binary. Endianness is switched iff endIn != endOut.
-LITTLEENDIAN  = '<'
-BIGENDIAN     = '>'
-def hex_to_binary(h, endIn=LITTLEENDIAN, endOut=LITTLEENDIAN):
-   bout = h[:]  # Copies data, no references.
-   if not endIn==endOut:
-      bout = hex_switchEndian(bout)
-   return bout.decode('hex_codec')
+LITTLEENDIAN = '<'
+BIGENDIAN = '>'
+def hex_to_binary(h):
+    bout = h[:]  # Copies data, no references.
+    return bout.decode('hex_codec')
+
 
 def base58_check_encode(s, version):
     # Calculate checksum.
     vs = chr(version) + s
     check = dhash(vs)[:4]
-    foo = vs + check
+    vs_and_check = vs + check
 
     # Pad.
     pad = 0
-    for c in foo:
-        if c == chr(0): pad += 1
-        else: break
+    for c in vs_and_check:
+        if c == chr(0):
+            pad += 1
+        else:
+            break
 
     # Base58 encode.
-    n = int('0x' + foo.encode('hex'), 16)
+    n = int('0x' + vs_and_check.encode('hex'), 16)
     l = []
     while n > 0:
         n, r = divmod(n, 58)
-        l.insert(0, (__b58chars[r]))
+        l.insert(0, (b58chars[r]))
     res = ''.join(l)
 
-    return __b58chars[0] * pad + res
+    return b58chars[0] * pad + res
+
 
 def base58_check_decode(s, version):
     # Pad.
     pad = 0
     for c in s:
-        if c == __b58chars[0]: pad += 1
-        else: break
-    
+        if c == b58chars[0]:
+            pad += 1
+        else:
+            break
+
     # Base58 decode.
     n = 0
     for ch in s:
         n *= 58
-        digit = __b58chars.index(ch)
+        digit = b58chars.index(ch)
         n += digit
     h = '%x' % n
     if len(h) % 2:
@@ -94,8 +100,8 @@ def base58_check_decode(s, version):
     return data
 
 
-class Wallet:
-    def __init__ (self, generate=False):
+class Wallet(object):
+    def __init__(self, generate=False):
         self.compressed = DEFAULT_COMPRESSED
 
         # Generate new wallet (i.e. seed) on null input.
@@ -104,7 +110,8 @@ class Wallet:
         else:
             unknown_input = raw_input('Enter a seed (RFC 1751) or private key '
                                       '(Wallet Import Format): ')
-            if not unknown_input: sys.exit(errno.EINVAL)
+            if not unknown_input:
+                sys.exit(errno.EINVAL)
 
             # If the input does not contain any spaces, it’s a private key.
             if ' ' not in unknown_input:
@@ -123,10 +130,10 @@ class Wallet:
             # If the input does contain at least one space, it’s an RFC 1751 seed.
             else:
                 self.seed = Crypto.Util.RFC1751.english_to_key(unknown_input)
-                if (not unknown_input.upper() == Crypto.Util.RFC1751.key_to_english(self.seed) or
-                    not len(self.seed) * 8 == 128): # HACK
+                if not unknown_input.upper() == Crypto.Util.RFC1751.key_to_english(self.seed) or \
+                    not len(self.seed) * 8 == 128: # HACK
                     print('Error: Invalid RFC 1751 seed (wrong length). '
-                            'RFC 1751 seeds must be twelve words long.',
+                          'RFC 1751 seeds must be twelve words long.',
                           file=sys.stderr)
                     sys.exit(errno.EINVAL)
 
@@ -165,19 +172,17 @@ class Wallet:
         # Get address from public key.
         self.address = pybitcointools.pubtoaddr(self.public_key_hex)
 
-        self.wallet_dict = {
-                            'seed_rfc1751': self.seed_rfc1751,
+        self.wallet_dict = {'seed_rfc1751': self.seed_rfc1751,
                             'public_key_hex': self.public_key_hex,
                             'private_key_wif': self.private_key_wif,
-                            'address': self.address
-                           }
+                            'address': self.address}
         self.wallet_json = json.dumps(self.wallet_dict, sort_keys=True, indent=4)
 
-    def print (self):
+    def print(self):
         print(self.wallet_json)
 
     # Save wallet.
-    def save (self):
+    def save(self):
         filename = self.address + '.spelter.json'
         with open(filename, 'w') as outfile:
             outfile.write(self.wallet_json + '\n')
@@ -185,25 +190,25 @@ class Wallet:
 
 
 def sign_tx(unsigned_tx, wallet):
-    private_key_hex = binascii.hexlify(base58_check_decode(wallet.private_key_wif, VERSION_PRIVATE_KEY))
+    private_key_hex = binascii.hexlify(base58_check_decode(wallet.private_key_wif,
+                                                           VERSION_PRIVATE_KEY))
     tx = unsigned_tx
     for i in range(len(pybitcointools.deserialize(tx)['ins'])):
         tx = pybitcointools.sign(tx, i, private_key_hex)
     signed_tx = tx
     return signed_tx
 
+
 def broadcast_tx(signed_tx):
     return pybitcointools.pushtx(signed_tx)
 
 
-if __name__ == '__main__':
+def main():
 
     # Parse command‐line arguments.
     parser = argparse.ArgumentParser(prog='spelter', description='')
-    parser.add_argument('--version', action='store_true', 
-                        help='print version information')
-    subparsers = parser.add_subparsers(dest='action', 
-                                       help='the action to be taken')
+    parser.add_argument('--version', action='store_true', help='print version information')
+    subparsers = parser.add_subparsers(dest='action', help='the action to be taken')
 
     parser_generate = subparsers.add_parser('generate', help='generate and print a new wallet')
 
@@ -236,9 +241,9 @@ if __name__ == '__main__':
         signed_tx = sign_tx(args.unsigned_tx, wallet)
         print('Signed transaction:', signed_tx)
         print('Signed transaction saved to: ./signed.hex')
-	with open('signed.hex', 'w') as f:
-	    f.write(signed_tx)
-	    f.write('\n')
+        with open('signed.hex', 'w') as f:
+            f.write(signed_tx)
+            f.write('\n')
 
     elif args.action == 'broadcast_tx':
         print(broadcast_tx(args.signed_tx))
@@ -250,6 +255,10 @@ if __name__ == '__main__':
     else:
         parser.print_help()
         sys.exit(errno.EINVAL)
+
+
+if __name__ == '__main__':
+    main()
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
