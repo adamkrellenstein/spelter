@@ -21,7 +21,6 @@ import pybitcointools
 # UNIT_NAME = 'mBTC'
 UNIT = 100000000 / 1        # BTC
 UNIT_NAME = 'BTC'
-DEFAULT_COMPRESSED = True
 
 DUST_SIZE = 60000
 
@@ -102,7 +101,7 @@ def base58_check_decode(s, version):
 
 class Wallet(object):
     def __init__(self, generate=False):
-        self.compressed = DEFAULT_COMPRESSED
+        self.compressed = True
 
         # Generate new wallet (i.e. seed) on null input.
         if generate:
